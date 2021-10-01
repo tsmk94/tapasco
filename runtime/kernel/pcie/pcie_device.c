@@ -26,6 +26,7 @@
 #include "pcie.h"
 #include "pcie_device.h"
 #include "pcie_irq.h"
+#include "pcie_qdma.h"
 #include "tlkm_logging.h"
 #include "tlkm_device.h"
 #include "tlkm_bus.h"
@@ -212,6 +213,19 @@ static int claim_msi(struct tlkm_pcie_device *pdev)
 	dev_id_t const did = pdev->parent->dev_id;
 
 	int no_int = pdev->parent->cls->number_of_interrupts;
+
+	/* FIXME quick and dirty solution
+	 * a better solution would be to define an own tlkm_class like it is
+	 * done for AWS, however we would like to keep the same DEVICE_ID
+	 * no matter whether using BlueDMA or QDMA
+	 *
+	 * TODO support more than 28 user interrupts
+	 * We currently use "direct" interrupts only, by using a AWS-like
+	 * solution we could provide all 128 user interrupts
+	 */
+	if (pcie_is_qdma_in_use(pdev->parent))
+		no_int = 32;
+
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
 	pdev->msix_entries =
@@ -404,10 +418,21 @@ int pcie_device_init_subsystems(struct tlkm_device *dev, void *data)
 		goto pcie_subsystem_err;
 	}
 
+	if (pcie_is_qdma_in_use(dev)) {
+		DEVLOG(dev->dev_id, TLKM_LF_PCIE, "initializing QDMA ...");
+		ret = pcie_qdma_init(pdev);
+		if (ret) {
+			DEVERR(dev->dev_id, "failed to initialize QDMA: %d", ret);
+			goto pcie_qdma_init_err;
+		}
+	}
+
 	DEVLOG(dev->dev_id, TLKM_LF_DEVICE,
 	       "successfully initialized subsystems");
 
 	return 0;
+
+pcie_qdma_init_err:
 pcie_subsystem_err:
 	return ret;
 }
@@ -417,6 +442,11 @@ void pcie_device_exit_subsystems(struct tlkm_device *dev)
 	struct tlkm_pcie_device *pdev =
 		(struct tlkm_pcie_device *)dev->private_data;
 	release_msi(pdev);
+	if (pcie_is_qdma_in_use(dev)) {
+		if (pcie_qdma_exit(pdev)) {
+			DEVERR(dev->dev_id, "could not disable QDMA properly");
+		}
+	}
 	DEVLOG(dev->dev_id, TLKM_LF_DEVICE, "exited subsystems");
 }
 
