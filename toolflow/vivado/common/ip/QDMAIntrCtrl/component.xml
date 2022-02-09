@@ -328,7 +328,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>d6ebe23b</spirit:value>
+            <spirit:value>220bab05</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -344,7 +344,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>dc2c0ede</spirit:value>
+            <spirit:value>46ddd302</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -810,7 +810,7 @@
         <spirit:wire>
           <spirit:direction>in</spirit:direction>
           <spirit:vector>
-            <spirit:left spirit:format="long">27</spirit:left>
+            <spirit:left spirit:format="long">127</spirit:left>
             <spirit:right spirit:format="long">0</spirit:right>
           </spirit:vector>
           <spirit:wireTypeDefs>
@@ -861,7 +861,7 @@
       <spirit:file>
         <spirit:name>src/mkQDMAIntrCtrl.v</spirit:name>
         <spirit:fileType>verilogSource</spirit:fileType>
-        <spirit:userFileType>CHECKSUM_e549bdef</spirit:userFileType>
+        <spirit:userFileType>CHECKSUM_2dd1851c</spirit:userFileType>
       </spirit:file>
     </spirit:fileSet>
     <spirit:fileSet>
@@ -927,6 +927,7 @@
         <xilinx:family xilinx:lifeCycle="Pre-Production">virtexuplusHBM</xilinx:family>
         <xilinx:family xilinx:lifeCycle="Pre-Production">kintexuplus</xilinx:family>
         <xilinx:family xilinx:lifeCycle="Pre-Production">kintexu</xilinx:family>
+        <xilinx:family xilinx:lifeCycle="Pre-Production">versal</xilinx:family>
       </xilinx:supportedFamilies>
       <xilinx:taxonomies>
         <xilinx:taxonomy>/UserIP</xilinx:taxonomy>
@@ -934,7 +935,7 @@
       <xilinx:displayName>QDMAIntrCtrl</xilinx:displayName>
       <xilinx:definitionSource>package_project</xilinx:definitionSource>
       <xilinx:coreRevision>1</xilinx:coreRevision>
-      <xilinx:coreCreationDateTime>2021-09-24T12:13:25Z</xilinx:coreCreationDateTime>
+      <xilinx:coreCreationDateTime>2022-02-04T14:53:35Z</xilinx:coreCreationDateTime>
       <xilinx:tags>
         <xilinx:tag xilinx:name="nopcore"/>
       </xilinx:tags>
@@ -943,8 +944,8 @@
       <xilinx:xilinxVersion>2020.2</xilinx:xilinxVersion>
       <xilinx:checksum xilinx:scope="busInterfaces" xilinx:value="18a9b06f"/>
       <xilinx:checksum xilinx:scope="memoryMaps" xilinx:value="5ccc3619"/>
-      <xilinx:checksum xilinx:scope="fileGroups" xilinx:value="b5291e93"/>
-      <xilinx:checksum xilinx:scope="ports" xilinx:value="89f25772"/>
+      <xilinx:checksum xilinx:scope="fileGroups" xilinx:value="45fbc59e"/>
+      <xilinx:checksum xilinx:scope="ports" xilinx:value="fb072a5f"/>
       <xilinx:checksum xilinx:scope="parameters" xilinx:value="268506f8"/>
     </xilinx:packagingInfo>
   </spirit:vendorExtensions>

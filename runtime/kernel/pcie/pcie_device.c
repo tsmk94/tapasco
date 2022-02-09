@@ -214,19 +214,6 @@ static int claim_msi(struct tlkm_pcie_device *pdev)
 
 	int no_int = pdev->parent->cls->number_of_interrupts;
 
-	/* FIXME quick and dirty solution
-	 * a better solution would be to define an own tlkm_class like it is
-	 * done for AWS, however we would like to keep the same DEVICE_ID
-	 * no matter whether using BlueDMA or QDMA
-	 *
-	 * TODO support more than 28 user interrupts
-	 * We currently use "direct" interrupts only, by using a AWS-like
-	 * solution we could provide all 128 user interrupts
-	 */
-	if (pcie_is_qdma_in_use(pdev->parent))
-		no_int = 32;
-
-
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
 	pdev->msix_entries =
 		kzalloc(sizeof(struct msix_entry) * no_int, GFP_KERNEL);
@@ -411,13 +398,6 @@ int pcie_device_init_subsystems(struct tlkm_device *dev, void *data)
 		}
 	}
 
-	DEVLOG(dev->dev_id, TLKM_LF_PCIE, "claiming MSI-X interrupts ...");
-	if ((ret = claim_msi(pdev))) {
-		DEVERR(dev->dev_id, "failed to claim MSI-X interrupts: %d",
-		       ret);
-		goto pcie_subsystem_err;
-	}
-
 	if (pcie_is_qdma_in_use(dev)) {
 		DEVLOG(dev->dev_id, TLKM_LF_PCIE, "initializing QDMA ...");
 		ret = pcie_qdma_init(pdev);
@@ -425,6 +405,13 @@ int pcie_device_init_subsystems(struct tlkm_device *dev, void *data)
 			DEVERR(dev->dev_id, "failed to initialize QDMA: %d", ret);
 			goto pcie_qdma_init_err;
 		}
+	}
+
+	DEVLOG(dev->dev_id, TLKM_LF_PCIE, "claiming MSI-X interrupts ...");
+	if ((ret = claim_msi(pdev))) {
+		DEVERR(dev->dev_id, "failed to claim MSI-X interrupts: %d",
+		       ret);
+		goto pcie_subsystem_err;
 	}
 
 	DEVLOG(dev->dev_id, TLKM_LF_DEVICE,

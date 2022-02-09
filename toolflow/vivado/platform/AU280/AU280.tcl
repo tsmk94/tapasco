@@ -71,18 +71,23 @@ namespace eval platform {
       set int_design 0
       set int_host 0
 
-      # QDMA supports currenlty only 28 user interrupts and no host interrupts
-      set design_concat [tapasco::ip::create_xlconcat "int_cc_design_0" 28]
+      set design_concats_last [tapasco::ip::create_xlconcat "int_cc_design_0" 32]
+      set design_concats [list $design_concats_last]
 
       foreach {name clk} $int_list port $int_in {
         puts "Connecting ${name} (Clk: ${clk}) to ${port}"
         if {$clk == "host"} {
           error "QDMA does not support host interrupts"
         } elseif {$clk == "design"} {
-          if { $int_design >= 28} {
-            error "QDMA supports currently only 28 design interrupts"
+          if { $int_design >= 32 } {
+            set n [llength $design_concats]
+            set design_concats_last [tapasco::ip::create_xlconcat "int_cc_design_${n}" 32]
+
+            lappend design_concats $design_concats_last
+
+            set int_design 0
           }
-          connect_bd_net ${port} [get_bd_pins ${design_concat}/In${int_design}]
+          connect_bd_net ${port} [get_bd_pins ${design_concats_last}/In${int_design}]
 
           lappend int_mapping [expr 4 + $int_design_total]
 
@@ -95,12 +100,21 @@ namespace eval platform {
 
       ::tapasco::ip::set_interrupt_mapping $int_mapping
 
+      if {[llength $design_concats] > 1} {
+        set cntr 0
+        set design_concats_last [tapasco::ip::create_xlconcat "int_cc_design_merge" [llength $design_concats]]
+        foreach con $design_concats {
+          connect_bd_net [get_bd_pins $con/dout] [get_bd_pins ${design_concats_last}/In${cntr}]
+          incr cntr
+        }
+      }
+
       # create QDMA interrupt controller
       set qdma_intr_ctrl [tapasco::ip::create_qdma_intr_ctrl "qdma_intr_ctrl"]
 
       connect_bd_intf_net $s_axi [get_bd_intf_pins $qdma_intr_ctrl/S_AXI]
       connect_bd_intf_net [get_bd_intf_pins $qdma_intr_ctrl/usr_irq] $usr_irq
-      connect_bd_net [get_bd_pins $design_concat/dout] [get_bd_pins $qdma_intr_ctrl/interrupt_design]
+      connect_bd_net [get_bd_pins $design_concats_last/dout] [get_bd_pins $qdma_intr_ctrl/interrupt_design]
 
       connect_bd_net $aclk [get_bd_pins $qdma_intr_ctrl/S_AXI_aclk]
       connect_bd_net $design_aclk [get_bd_pins $qdma_intr_ctrl/design_clk]
@@ -271,7 +285,15 @@ namespace eval platform {
         CONFIG.PF0_MSIX_CAP_PBA_BIR_qdma {BAR_3:2} \
         CONFIG.PF1_MSIX_CAP_PBA_BIR_qdma {BAR_3:2} \
         CONFIG.PF2_MSIX_CAP_PBA_BIR_qdma {BAR_3:2} \
-        CONFIG.PF3_MSIX_CAP_PBA_BIR_qdma {BAR_3:2}] [get_bd_cells qdma_0]
+        CONFIG.PF3_MSIX_CAP_PBA_BIR_qdma {BAR_3:2} \
+        CONFIG.adv_int_usr {true} \
+        CONFIG.en_pcie_drp {true}] [get_bd_cells qdma_0]
+
+      set qdma_conf [tapasco::ip::create_qdma_configurator qdma_conf_0]
+      connect_bd_net $pcie_aclk_in [get_bd_pins $qdma_conf/clk] [get_bd_pins $qdma/drp_clk]
+      connect_bd_net $pcie_p_aresetn [get_bd_pins $qdma_conf/resetn]
+      connect_bd_intf_net [get_bd_intf_pins $qdma_conf/drp] [get_bd_intf_pins $qdma/drp]
+      connect_bd_intf_net [get_bd_intf_pins $qdma_conf/msix_vector_ctrl] [get_bd_intf_pins $qdma/msix_vector_ctrl]
 
       # create AXI Smartconnect for Slave Bridge, and Dummy Master to make Vivado happy
       set in_ic [tapasco::ip::create_axi_sc "in_ic" 2 1]

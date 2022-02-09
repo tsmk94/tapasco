@@ -70,4 +70,5 @@ dict set stdcomps   dmi                  vlnv   "esa.informatik.tu-darmstadt.de:
 dict set stdcomps   axi_to_dmi           vlnv   "esa.informatik.tu-darmstadt.de:user:AXI_to_Dmi:1.0"
 dict set stdcomps   qdma_descriptor_gen  vlnv   "esa.informatik.tu-darmstadt.de:user:QDMADescriptorGenerator:1.0"
 dict set stdcomps   qdma_intr_ctrl       vlnv   "esa.informatik.tu-darmstadt.de:user:QDMAIntrCtrl:1.0"
+dict set stdcomps   qdma_configurator    vlnv   "esa.informatik.tu-darmstadt.de:user:QDMAConfigurator:1.0"
 dict set stdcomps   axi_dummy_master     vlnv   "esa.informatik.tu-darmstadt.de:user:AXIDummyMaster:1.0"
