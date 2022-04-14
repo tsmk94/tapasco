@@ -143,7 +143,7 @@ namespace eval arch {
 
     # create master ports
     set maxi_ports [list]
-    foreach mp [get_bd_intf_pins -of_objects $inst -filter {MODE == Master && CONFIG.PROTOCOL == AXI4}] {
+    foreach mp [get_bd_intf_pins -of_objects $inst -filter {MODE == Master && (CONFIG.PROTOCOL == AXI4 || CONFIG.PROTOCOL == AXI3)}] {
       set op [create_bd_intf_pin -vlnv "xilinx.com:interface:aximm_rtl:1.0" -mode Master [get_property NAME $mp]]
       connect_bd_intf_net $mp $op
       lappend maxi_ports $mp
@@ -360,6 +360,7 @@ namespace eval arch {
           set intr_name "PE_${i}_${pe_sub_interrupt}"
           puts "Creating interrupt $intr_name"
           connect_bd_net $pin [::tapasco::ip::add_interrupt $intr_name "design"]
+          incr pe_sub_interrupt
       }
       incr i
     }

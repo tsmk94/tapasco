@@ -21,7 +21,6 @@
 use crate::debug::DebugControl;
 use crate::device::DataTransferPrealloc;
 use crate::device::DeviceAddress;
-use crate::device::DeviceSize;
 use crate::device::OffchipMemory;
 use crate::device::PEParameter;
 use crate::interrupt::Interrupt;
@@ -29,7 +28,7 @@ use memmap::MmapMut;
 use snafu::ResultExt;
 use std::fs::File;
 use std::sync::Arc;
-use volatile::Volatile;
+use std::ptr::write_volatile;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -79,6 +78,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum CopyBack {
     Transfer(DataTransferPrealloc),
     Free(DeviceAddress, Arc<OffchipMemory>),
+    Return(DataTransferPrealloc),               // used to return ownership only when using SVM
 }
 
 pub type PEId = usize;
@@ -95,12 +95,14 @@ pub struct PE {
     id: usize,
     #[get = "pub"]
     type_id: PEId,
+    // This public getter is guarded behind conditional compilation for `tapasco-debug`:
+    #[cfg_attr(feature = "tapasco-debug", get = "pub")]
     offset: DeviceAddress,
-    size: DeviceSize,
-    name: String,
     #[get = "pub"]
     active: bool,
     copy_back: Option<Vec<CopyBack>>,
+    // This public getter is guarded behind conditional compilation for `tapasco-debug`:
+    #[cfg_attr(feature = "tapasco-debug", get = "pub")]
     memory: Arc<MmapMut>,
 
     #[set = "pub"]
@@ -110,6 +112,9 @@ pub struct PE {
     interrupt: Interrupt,
 
     debug: Box<dyn DebugControl + Sync + Send>,
+
+    #[get = "pub"]
+    svm_in_use: bool,
 }
 
 impl PE {
@@ -117,36 +122,33 @@ impl PE {
         id: usize,
         type_id: PEId,
         offset: DeviceAddress,
-        size: DeviceSize,
-        name: String,
         memory: Arc<MmapMut>,
         completion: &File,
         interrupt_id: usize,
         debug: Box<dyn DebugControl + Sync + Send>,
-    ) -> Result<PE> {
-        Ok(PE {
-            id: id,
-            type_id: type_id,
-            offset: offset,
-            size: size,
-            name: name,
+        svm_in_use: bool,
+    ) -> Result<Self> {
+        Ok(Self {
+            id,
+            type_id,
+            offset,
             active: false,
             copy_back: None,
-            memory: memory,
+            memory,
             local_memory: None,
-            interrupt: Interrupt::new(completion, interrupt_id, false).context(ErrorInterrupt)?,
-            debug: debug,
+            interrupt: Interrupt::new(completion, interrupt_id, false).context(ErrorInterruptSnafu)?,
+            debug,
+            svm_in_use,
         })
     }
 
     pub fn start(&mut self) -> Result<()> {
-        ensure!(!self.active, PEAlreadyActive { id: self.id });
+        ensure!(!self.active, PEAlreadyActiveSnafu { id: self.id });
         trace!("Starting PE {}.", self.id);
         let offset = self.offset as isize;
         unsafe {
             let ptr = self.memory.as_ptr().offset(offset);
-            let volatile_ptr = ptr as *mut Volatile<u32>;
-            (*volatile_ptr).write(1);
+            write_volatile(ptr as *mut u32, 1);
         }
         self.active = true;
         Ok(())
@@ -164,11 +166,11 @@ impl PE {
     }
 
     /// Waits for a PE interrupt and deactivates the PE afterwards
-    fn wait_for_completion(&mut self) -> Result<()> {
+    pub fn wait_for_completion(&mut self) -> Result<()> {
         if self.active {
             self.interrupt
                 .wait_for_interrupt()
-                .context(ErrorInterrupt)?;
+                .context(ErrorInterruptSnafu)?;
             trace!("Cleaning up PE {} after release.", self.id);
             self.active = false;
             self.reset_interrupt(true)?;
@@ -182,8 +184,7 @@ impl PE {
         let offset = (self.offset as usize + 0x0c) as isize;
         let r = unsafe {
             let ptr = self.memory.as_ptr().offset(offset);
-            let volatile_ptr = ptr as *mut Volatile<u32>;
-            (*volatile_ptr).read()
+            ptr.read_volatile()
         };
         let s = (r & 1) == 1;
         trace!("Reading interrupt status from 0x{:x} -> {}", offset, s);
@@ -195,8 +196,7 @@ impl PE {
         trace!("Resetting interrupts: 0x{:x} -> {}", offset, v);
         unsafe {
             let ptr = self.memory.as_ptr().offset(offset);
-            let volatile_ptr = ptr as *mut Volatile<u32>;
-            (*volatile_ptr).write(if v { 1 } else { 0 });
+            write_volatile(ptr as *mut u32, if v { 1 } else { 0 });
         }
         Ok(())
     }
@@ -205,15 +205,13 @@ impl PE {
         let mut offset = (self.offset as usize + 0x04) as isize;
         let g = unsafe {
             let ptr = self.memory.as_ptr().offset(offset);
-            let volatile_ptr = ptr as *mut Volatile<u32>;
-            (*volatile_ptr).read()
+            ptr.read_volatile()
         } & 1
             == 1;
         offset = (self.offset as usize + 0x08) as isize;
         let l = unsafe {
             let ptr = self.memory.as_ptr().offset(offset);
-            let volatile_ptr = ptr as *mut Volatile<u32>;
-            (*volatile_ptr).read()
+            ptr.read_volatile()
         } & 1
             == 1;
         trace!("Interrupt status is {}, {}", g, l);
@@ -221,20 +219,18 @@ impl PE {
     }
 
     pub fn enable_interrupt(&self) -> Result<()> {
-        ensure!(!self.active, PEAlreadyActive { id: self.id });
+        ensure!(!self.active, PEAlreadyActiveSnafu { id: self.id });
         let mut offset = (self.offset as usize + 0x04) as isize;
         trace!("Enabling interrupts: 0x{:x} -> 1", offset);
         unsafe {
             let ptr = self.memory.as_ptr().offset(offset);
-            let volatile_ptr = ptr as *mut Volatile<u32>;
-            (*volatile_ptr).write(1);
+            write_volatile(ptr as *mut u32, 1);
         }
         offset = (self.offset as usize + 0x08) as isize;
         trace!("Enabling global interrupts: 0x{:x} -> 1", offset);
         unsafe {
             let ptr = self.memory.as_ptr().offset(offset);
-            let volatile_ptr = ptr as *mut Volatile<u32>;
-            (*volatile_ptr).write(1);
+            write_volatile(ptr as *mut u32, 1);
         }
         Ok(())
     }
@@ -245,8 +241,8 @@ impl PE {
         unsafe {
             let ptr = self.memory.as_ptr().offset(offset);
             match arg {
-                PEParameter::Single32(x) => (*(ptr as *mut Volatile<u32>)).write(x),
-                PEParameter::Single64(x) => (*(ptr as *mut Volatile<u64>)).write(x),
+                PEParameter::Single32(x) => write_volatile(ptr as *mut u32, x),
+                PEParameter::Single64(x) => write_volatile(ptr as *mut u64, x),
                 _ => return Err(Error::UnsupportedParameter { param: arg }),
             };
         }
@@ -259,10 +255,10 @@ impl PE {
             let ptr = self.memory.as_ptr().offset(offset);
             match bytes {
                 4 => Ok(PEParameter::Single32(
-                    (*(ptr as *const Volatile<u32>)).read(),
+                        ptr.cast::<u32>().read_volatile()
                 )),
                 8 => Ok(PEParameter::Single64(
-                    (*(ptr as *const Volatile<u64>)).read(),
+                        ptr.cast::<u64>().read_volatile()
                 )),
                 _ => Err(Error::UnsupportedRegisterSize { param: bytes }),
             }
@@ -281,7 +277,7 @@ impl PE {
         let offset = (self.offset as usize + 0x10) as isize;
         let r = unsafe {
             let ptr = self.memory.as_ptr().offset(offset);
-            (*(ptr as *const Volatile<u64>)).read()
+            ptr.cast::<u64>().read_volatile()
         };
         trace!("Reading return value: {}", r);
         r
@@ -298,6 +294,6 @@ impl PE {
     pub fn enable_debug(&mut self) -> Result<()> {
         self.debug
             .enable_debug()
-            .context(DebugError { id: self.id })
+            .context(DebugSnafu { id: self.id })
     }
 }

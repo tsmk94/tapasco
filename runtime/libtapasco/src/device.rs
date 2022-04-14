@@ -18,14 +18,15 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-use crate::allocator::{Allocator, DriverAllocator, GenericAllocator, VfioAllocator};
-use crate::debug::DebugGenerator;
-use crate::dma::{DMAControl, DirectDMA, DriverDMA, VfioDMA};
+use crate::allocator::{Allocator, DriverAllocator, DummyAllocator, GenericAllocator, VfioAllocator};
+use crate::debug::{DebugGenerator, NonDebugGenerator};
+use crate::dma::{DMAControl, DirectDMA, DriverDMA, VfioDMA, SVMDMA};
 use crate::dma_user_space::UserSpaceDMA;
 use crate::job::Job;
 use crate::pe::PEId;
+use crate::pe::PE;
 use crate::scheduler::Scheduler;
-use crate::tlkm::tlkm_access;
+use crate::tlkm::{tlkm_access, tlkm_ioctl_svm_launch, tlkm_svm_init_cmd};
 use crate::tlkm::tlkm_ioctl_create;
 use crate::tlkm::tlkm_ioctl_destroy;
 use crate::tlkm::tlkm_ioctl_device_cmd;
@@ -64,10 +65,10 @@ pub enum Error {
     StatusCoreDecoding { source: prost::DecodeError },
 
     #[snafu(display(
-        "Could not acquire desired mode {:?} for device {}: {}",
-        access,
-        id,
-        source
+    "Could not acquire desired mode {:?} for device {}: {}",
+    access,
+    id,
+    source
     ))]
     IOCTLCreate {
         source: nix::Error,
@@ -103,13 +104,32 @@ pub enum Error {
     ConfigError { source: config::ConfigError },
 
     #[snafu(display("Could not initialize VFIO subsystem: {}", source))]
-    VfioInitError  { source: crate::vfio::Error },
+    VfioInitError { source: crate::vfio::Error },
+
+    #[snafu(display("Could not launch SVM support in the TLKM"))]
+    SVMInitError { source: nix::Error },
+
+    #[snafu(display("Could not find component {}.", name))]
+    ComponentNotFound { name: String },
+
+    #[snafu(display(
+        "Component {} has no associated interrupt. Cannot be used as PE.",
+        name
+    ))]
+    MissingInterrupt { name: String },
+
+    #[snafu(display("PE Error: {}", source))]
+    PEError { source: crate::pe::Error },
+
+    #[snafu(display("Debug Error: {}", source))]
+    DebugError { source: crate::debug::Error },
 }
+
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl<T> From<std::sync::PoisonError<T>> for Error {
     fn from(_error: std::sync::PoisonError<T>) -> Self {
-        Error::MutexError {}
+        Self::MutexError {}
     }
 }
 
@@ -197,6 +217,8 @@ pub enum PEParameter {
     DataTransferAlloc(DataTransferAlloc),
     /// Transfer using any memory with preallocated space.
     DataTransferPrealloc(DataTransferPrealloc),
+    /// Virtual address parameter used for SVM.
+    VirtualAddress(*const u8),
 }
 
 // End of PE parameters.
@@ -222,11 +244,9 @@ pub struct Device {
     access: tlkm_access,
     scheduler: Arc<Scheduler>,
     platform: Arc<MmapMut>,
-    arch: Arc<MmapMut>,
     offchip_memory: Vec<Arc<OffchipMemory>>,
     tlkm_file: Arc<File>,
     tlkm_device_file: Arc<File>,
-    settings: Arc<Config>,
 }
 
 impl Device {
@@ -245,7 +265,7 @@ impl Device {
         name: String,
         settings: Arc<Config>,
         debug_impls: &HashMap<String, Box<dyn DebugGenerator + Sync + Send>>,
-    ) -> Result<Device> {
+    ) -> Result<Self> {
         trace!("Open driver device file.");
 
         let tlkm_dma_file = Arc::new(
@@ -255,11 +275,11 @@ impl Device {
                 .open(format!(
                     "{}{:02}",
                     settings
-                        .get_str("tlkm.device_driver_file")
-                        .context(ConfigError)?,
+                        .get_string("tlkm.device_driver_file")
+                        .context(ConfigSnafu)?,
                     id
                 ))
-                .context(DeviceUnavailable { id: id })?,
+                .context(DeviceUnavailableSnafu { id })?,
         );
 
         trace!("Mapping status core.");
@@ -269,7 +289,7 @@ impl Device {
                     .len(8192)
                     .offset(0)
                     .map(&tlkm_dma_file)
-                    .context(DeviceUnavailable { id: id })?
+                    .context(DeviceUnavailableSnafu { id })?
             };
             trace!("Mapped status core: {}", mmap[0]);
 
@@ -282,7 +302,7 @@ impl Device {
                 mmap_cpy[i] = mmap[i];
             }
 
-            status::Status::decode_length_delimited(&mmap_cpy[..]).context(StatusCoreDecoding)?
+            status::Status::decode_length_delimited(&mmap_cpy[..]).context(StatusCoreDecodingSnafu)?
         };
 
         trace!("Status core decoded: {:?}", s);
@@ -301,7 +321,7 @@ impl Device {
                 .len(platform_size as usize)
                 .offset(8192)
                 .map_mut(&tlkm_dma_file)
-                .context(DeviceUnavailable { id: id })?
+                .context(DeviceUnavailableSnafu { id })?
         });
 
         let arch_size = match &s.arch_base {
@@ -316,7 +336,7 @@ impl Device {
                 .len(arch_size as usize)
                 .offset(4096)
                 .map_mut(&tlkm_dma_file)
-                .context(DeviceUnavailable { id: id })?
+                .context(DeviceUnavailableSnafu { id })?
         });
 
         // Initialize the global memories.
@@ -327,96 +347,126 @@ impl Device {
         let mut allocator = Vec::new();
         let zynqmp_vfio_mode = true;
         let mut is_pcie = false;
+        let mut svm_in_use = false;
         if name == "pcie" {
-            info!("Allocating the default of 4GB at 0x0 for a PCIe platform");
-            let mut dma_offset = 0;
-            let mut dma_interrupt_read = 0;
-            let mut dma_interrupt_write = 1;
+
+            // check whether SVM is in use
             for comp in &s.platform {
-                if comp.name == "PLATFORM_COMPONENT_DMA0" {
-                    dma_offset = comp.offset;
-                    for v in &comp.interrupts {
-                        if v.name == "READ" {
-                            dma_interrupt_read = v.mapping as usize;
-                        } else if v.name == "WRITE" {
-                            dma_interrupt_write = v.mapping as usize;
-                        } else {
-                            trace!("Unknown DMA interrupt: {}.", v.name);
+                if comp.name == "PLATFORM_COMPONENT_MMU" {
+                    svm_in_use = true;
+                }
+            }
+
+            if !svm_in_use {
+                info!("Allocating the default of 4GB at 0x0 for a PCIe platform");
+                let mut dma_offset = 0;
+                let mut dma_interrupt_read = 0;
+                let mut dma_interrupt_write = 1;
+                for comp in &s.platform {
+                    if comp.name == "PLATFORM_COMPONENT_DMA0" {
+                        dma_offset = comp.offset;
+                        for v in &comp.interrupts {
+                            if v.name == "READ" {
+                                dma_interrupt_read = v.mapping as usize;
+                            } else if v.name == "WRITE" {
+                                dma_interrupt_write = v.mapping as usize;
+                            } else {
+                                trace!("Unknown DMA interrupt: {}.", v.name);
+                            }
                         }
                     }
                 }
-            }
-            if dma_offset == 0 {
-                trace!("Could not find DMA engine.");
-                return Err(Error::DMAEngineMissing {});
-            }
+                if dma_offset == 0 {
+                    trace!("Could not find DMA engine.");
+                    return Err(Error::DMAEngineMissing {});
+                }
 
-            is_pcie = true;
+                is_pcie = true;
 
-            allocator.push(Arc::new(OffchipMemory {
-                allocator: Mutex::new(Box::new(
-                    GenericAllocator::new(0, 4 * 1024 * 1024 * 1024, 64).context(AllocatorError)?,
-                )),
-                dma: Box::new(
-                    UserSpaceDMA::new(
-                        &tlkm_dma_file,
-                        dma_offset as usize,
-                        dma_interrupt_read,
-                        dma_interrupt_write,
-                        &platform,
-                        settings
-                            .get::<usize>("dma.read_buffer_size")
-                            .context(ConfigError)?,
-                        settings
-                            .get::<usize>("dma.read_buffers")
-                            .context(ConfigError)?,
-                        settings
-                            .get::<usize>("dma.write_buffer_size")
-                            .context(ConfigError)?,
-                        settings
-                            .get::<usize>("dma.write_buffers")
-                            .context(ConfigError)?,
-                    )
-                    .context(DMAError)?,
-                ),
-            }));
+                allocator.push(Arc::new(OffchipMemory {
+                    allocator: Mutex::new(Box::new(
+                        GenericAllocator::new(0, 4 * 1024 * 1024 * 1024, 64).context(AllocatorSnafu)?,
+                    )),
+                    dma: Box::new(
+                        UserSpaceDMA::new(
+                            &tlkm_dma_file,
+                            dma_offset as usize,
+                            dma_interrupt_read,
+                            dma_interrupt_write,
+                            &platform,
+                            settings
+                                .get::<usize>("dma.read_buffer_size")
+                                .context(ConfigSnafu)?,
+                            settings
+                                .get::<usize>("dma.read_buffers")
+                                .context(ConfigSnafu)?,
+                            settings
+                                .get::<usize>("dma.write_buffer_size")
+                                .context(ConfigSnafu)?,
+                            settings
+                                .get::<usize>("dma.write_buffers")
+                                .context(ConfigSnafu)?,
+                        )
+                            .context(DMASnafu)?,
+                    ),
+                }));
+            } else {
+                trace!("Using SVM...");
+                let mut init_cmd = tlkm_svm_init_cmd {
+                    result: 0,
+                };
+                unsafe {
+                    tlkm_ioctl_svm_launch(
+                        tlkm_dma_file.as_raw_fd(),
+                        &mut init_cmd,
+                    ).context(SVMInitSnafu)?;
+                }
+                allocator.push(Arc::new(OffchipMemory {
+                    allocator: Mutex::new(Box::new(DummyAllocator::new())),
+                    dma: Box::new(SVMDMA::new(&tlkm_dma_file)),
+                }));
+            }
         } else if name == "zynq" || (name == "zynqmp" && !zynqmp_vfio_mode) {
             info!("Using driver allocation for Zynq/ZynqMP based platform.");
             allocator.push(Arc::new(OffchipMemory {
                 allocator: Mutex::new(Box::new(
-                    DriverAllocator::new(&tlkm_dma_file).context(AllocatorError)?,
+                    DriverAllocator::new(&tlkm_dma_file).context(AllocatorSnafu)?,
                 )),
                 dma: Box::new(DriverDMA::new(&tlkm_dma_file)),
             }));
         } else if name == "zynqmp" {
             info!("Using VFIO mode for ZynqMP based platform.");
-            let vfio_dev = Arc::new(init_vfio(settings.clone())
-                .context(VfioInitError)?
+            let vfio_dev = Arc::new(init_vfio(settings)
+                .context(VfioInitSnafu)?
             );
             allocator.push(Arc::new(OffchipMemory {
                 allocator: Mutex::new(Box::new(
-                    VfioAllocator::new(&vfio_dev).context(AllocatorError)?,
+                    VfioAllocator::new(&vfio_dev).context(AllocatorSnafu)?,
                 )),
-                dma: Box::new(VfioDMA::new(&tlkm_dma_file, &vfio_dev)),
+                dma: Box::new(VfioDMA::new(&vfio_dev)),
             }));
         } else {
-            return Err(Error::DeviceType { name: name });
+            return Err(Error::DeviceType { name });
         }
 
-        trace!("Initialize PE local memories.");
         let mut pe_local_memories = VecDeque::new();
-        for pe in s.pe.iter() {
-            match &pe.local_memory {
-                Some(l) => {
-                    pe_local_memories.push_back(Arc::new(OffchipMemory {
-                        allocator: Mutex::new(Box::new(
-                            GenericAllocator::new(0, l.size, 1).context(AllocatorError)?,
-                        )),
-                        dma: Box::new(DirectDMA::new(l.base, l.size, arch.clone())),
-                    }));
+        if !svm_in_use {
+            trace!("Initialize PE local memories.");
+            for pe in &s.pe {
+                match &pe.local_memory {
+                    Some(l) => {
+                        pe_local_memories.push_back(Arc::new(OffchipMemory {
+                            allocator: Mutex::new(Box::new(
+                                GenericAllocator::new(0, l.size, 1).context(AllocatorSnafu)?,
+                            )),
+                            dma: Box::new(DirectDMA::new(l.base, l.size, arch.clone())),
+                        }));
+                    },
+                    None => (),
                 }
-                None => (),
             }
+        } else {
+            warn!("PE local memories not compatible with SVM currently");
         }
 
         trace!("Initialize PE scheduler.");
@@ -426,27 +476,26 @@ impl Device {
                 &arch,
                 pe_local_memories,
                 &tlkm_dma_file,
-                &debug_impls,
+                debug_impls,
                 is_pcie,
+                svm_in_use,
             )
-            .context(SchedulerError)?,
+                .context(SchedulerSnafu)?,
         );
 
         trace!("Device creation completed.");
-        let mut device = Device {
-            id: id,
-            vendor: vendor,
-            product: product,
+        let mut device = Self {
+            id,
+            vendor,
+            product,
             access: tlkm_access::TlkmAccessTypes,
-            name: name,
+            name,
             status: s,
-            scheduler: scheduler,
-            platform: platform,
-            arch: arch,
+            scheduler,
+            platform,
             offchip_memory: allocator,
-            tlkm_file: tlkm_file,
+            tlkm_file,
             tlkm_device_file: tlkm_dma_file,
-            settings: settings,
         };
 
         device.change_access(tlkm_access::TlkmAccessMonitor)?;
@@ -465,16 +514,35 @@ impl Device {
     pub fn acquire_pe(&self, id: PEId) -> Result<Job> {
         self.check_exclusive_access()?;
         trace!("Trying to acquire PE of type {}.", id);
-        let pe = self.scheduler.acquire_pe(id).context(SchedulerError)?;
+        let pe = self.scheduler.acquire_pe(id).context(SchedulerSnafu)?;
         trace!("Successfully acquired PE of type {}.", id);
         Ok(Job::new(pe, &self.scheduler))
     }
 
+    /// Request a PE from the device but don't create a Job for it. Usually [`acquire_pe`] is used
+    /// if you don't want to do things manually.
+    ///
+    /// # Arguments
+    ///   * id: The ID of the desired PE.
+    ///
+    pub fn acquire_pe_without_job(&self, id: PEId) -> Result<PE> {
+        trace!(
+            "Trying to acquire PE of type {} without exclusive access.",
+            id
+        );
+        let pe = self.scheduler.acquire_pe(id).context(SchedulerSnafu)?;
+        trace!(
+            "Successfully acquired PE of type {} without exclusive access.",
+            id
+        );
+        Ok(pe)
+    }
+
     fn check_exclusive_access(&self) -> Result<()> {
-        if self.access != tlkm_access::TlkmAccessExclusive {
-            Err(Error::ExclusiveRequired {})
-        } else {
+        if self.access == tlkm_access::TlkmAccessExclusive {
             Ok(())
+        } else {
+            Err(Error::ExclusiveRequired {})
         }
     }
 
@@ -495,14 +563,14 @@ impl Device {
 
         let mut request = tlkm_ioctl_device_cmd {
             dev_id: self.id,
-            access: access,
+            access,
         };
 
         trace!("Device {}: Trying to change mode to {:?}", self.id, access,);
 
         unsafe {
-            tlkm_ioctl_create(self.tlkm_file.as_raw_fd(), &mut request).context(IOCTLCreate {
-                access: access,
+            tlkm_ioctl_create(self.tlkm_file.as_raw_fd(), &mut request).context(IOCTLCreateSnafu {
+                access,
                 id: self.id,
             })?;
         };
@@ -511,7 +579,7 @@ impl Device {
 
         if access == tlkm_access::TlkmAccessExclusive {
             trace!("Access changed to exclusive, resetting all interrupts.");
-            self.scheduler.reset_interrupts().context(SchedulerError)?;
+            self.scheduler.reset_interrupts().context(SchedulerSnafu)?;
         }
 
         trace!("Successfully acquired access.");
@@ -528,7 +596,7 @@ impl Device {
             };
             unsafe {
                 tlkm_ioctl_destroy(self.tlkm_file.as_raw_fd(), &mut request)
-                    .context(IOCTLDestroy { id: self.id })?;
+                    .context(IOCTLDestroySnafu { id: self.id })?;
             }
             self.access = tlkm_access::TlkmAccessTypes;
         }
@@ -595,6 +663,88 @@ impl Device {
 
     /// Return the PEId of the PE with the given name
     pub fn get_pe_id(&self, name: &str) -> Result<PEId> {
-        self.scheduler.get_pe_id(name).context(SchedulerError)
+        self.scheduler.get_pe_id(name).context(SchedulerSnafu)
+    }
+
+    /// Get a list of platform components names available on this device
+    pub fn get_available_platform_components(&self) -> Vec<String> {
+        let mut platform_components = Vec::new();
+
+        for p in &self.status.platform {
+            trace!("Found platform component {}.", p.name);
+            platform_components.push(p.name.clone());
+        }
+
+        platform_components
+    }
+
+    /// Get memory of a platform component
+    ///
+    /// # Safety
+    ///
+    /// Treated unsafe as a user can change anything about the memory without any checks
+    /// and might try using the memory after the device has been released.
+    pub unsafe fn get_platform_component_memory(&self, name: &str) -> Result<&mut [u8]> {
+        for p in &self.status.platform {
+            if p.name == name {
+                trace!(
+                    "Found platform component {} at {:X} (Size {}).",
+                    p.name,
+                    p.offset,
+                    p.size
+                );
+
+                let ptr = self.platform.as_ptr().offset(p.offset as isize) as *mut u8;
+                let s = std::slice::from_raw_parts_mut(ptr, p.size as usize);
+                return Ok(s);
+            }
+        }
+        Err(Error::ComponentNotFound {
+            name: name.to_string(),
+        })
+    }
+
+    /// Returns a PE interface to the platform component
+    /// Can be used like any other PE but is not integrated
+    /// into the scheduling and job mechanisms
+    pub fn get_platform_component_as_pe(&self, name: &str) -> Result<PE> {
+        for p in &self.status.platform {
+            if p.name == name {
+                trace!(
+                    "Found platform component {} at {:X} (Size {}).",
+                    p.name,
+                    p.offset,
+                    p.size
+                );
+
+                let d = NonDebugGenerator {};
+                let debug = d
+                    .new(&self.platform, "Unused".to_string(), 0, 0)
+                    .context(DebugSnafu)?;
+
+                if !p.interrupts.is_empty() {
+                    return PE::new(
+                        // TODO: Should the ID of this PE really be 42? If it's necessarily a magic
+                        // value, why not just 0?
+                        42,
+                        42,
+                        p.offset,
+                        self.platform.clone(),
+                        &self.tlkm_device_file,
+                        p.interrupts[0].mapping as usize,
+                        debug,
+                        false,  // TODO: Is this correct?
+                    )
+                    .context(PESnafu);
+                } else {
+                    return Err(Error::MissingInterrupt {
+                        name: name.to_string(),
+                    });
+                }
+            }
+        }
+        Err(Error::ComponentNotFound {
+            name: name.to_string(),
+        })
     }
 }

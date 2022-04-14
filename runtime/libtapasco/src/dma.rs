@@ -20,7 +20,7 @@
 
 use crate::device::DeviceAddress;
 use crate::device::DeviceSize;
-use crate::tlkm::tlkm_copy_cmd_from;
+use crate::tlkm::{tlkm_copy_cmd_from, tlkm_ioctl_svm_migrate_to_dev, tlkm_ioctl_svm_migrate_to_ram, tlkm_svm_migrate_cmd};
 use crate::tlkm::tlkm_copy_cmd_to;
 use crate::tlkm::tlkm_ioctl_copy_from;
 use crate::tlkm::tlkm_ioctl_copy_to;
@@ -92,8 +92,8 @@ pub struct DriverDMA {
 }
 
 impl DriverDMA {
-    pub fn new(tlkm_file: &Arc<File>) -> DriverDMA {
-        DriverDMA {
+    pub fn new(tlkm_file: &Arc<File>) -> Self {
+        Self {
             tlkm_file: tlkm_file.clone(),
         }
     }
@@ -119,7 +119,7 @@ impl DMAControl for DriverDMA {
                     user_addr: data.as_ptr(),
                 },
             )
-            .context(DMAToDevice)?;
+            .context(DMAToDeviceSnafu)?;
         };
         Ok(())
     }
@@ -140,7 +140,7 @@ impl DMAControl for DriverDMA {
                     user_addr: data.as_mut_ptr(),
                 },
             )
-            .context(DMAFromDevice)?;
+            .context(DMAFromDeviceSnafu)?;
         };
         Ok(())
     }
@@ -148,14 +148,12 @@ impl DMAControl for DriverDMA {
 
 #[derive(Debug, Getters)]
 pub struct VfioDMA {
-    tlkm_file: Arc<File>,
     vfio_dev: Arc<VfioDev>,
 }
 
 impl VfioDMA {
-    pub fn new(tlkm_file: &Arc<File>, vfio_dev: &Arc<VfioDev>) -> VfioDMA {
-        VfioDMA {
-            tlkm_file: tlkm_file.clone(),
+    pub fn new(vfio_dev: &Arc<VfioDev>) -> Self {
+        Self {
             vfio_dev: vfio_dev.clone(),
         }
     }
@@ -177,13 +175,13 @@ impl DMAControl for VfioDMA {
         let iova_start = to_page_boundary(iova);
         let map_len = self.vfio_dev
             .get_region_size(iova_start)
-            .context(VfioError)?;
+            .context(VfioSnafu)?;
 
         trace!(
             "Copy Host({:?}) -> Device(0x{:x}) ({} Bytes). Map va=0x{:x} -> iova=0x{:x} len=0x{:x}",
             data.as_ptr(), iova, data.len(), va_start, iova_start, map_len
         );
-        return match vfio_dma_map(&self.vfio_dev, map_len, HP_OFFS + iova_start, va_start) {
+        match vfio_dma_map(&self.vfio_dev, map_len, HP_OFFS + iova_start, va_start) {
             Ok(_) => Ok(()),
             Err(e) => Err(Error::VfioError {source: e})
         }
@@ -215,11 +213,11 @@ pub struct DirectDMA {
 }
 
 impl DirectDMA {
-    pub fn new(offset: DeviceAddress, size: DeviceSize, memory: Arc<MmapMut>) -> DirectDMA {
-        DirectDMA {
-            offset: offset,
-            size: size,
-            memory: memory,
+    pub fn new(offset: DeviceAddress, size: DeviceSize, memory: Arc<MmapMut>) -> Self {
+        Self {
+            offset,
+            size,
+            memory,
         }
     }
 }
@@ -229,8 +227,8 @@ impl DMAControl for DirectDMA {
         let end = ptr + data.len() as u64;
         if end > self.size {
             return Err(Error::OutOfRange {
-                ptr: ptr,
-                end: end,
+                ptr,
+                end,
                 size: self.size,
             });
         }
@@ -248,7 +246,7 @@ impl DMAControl for DirectDMA {
         unsafe {
             let p = self.memory.as_ptr().offset((self.offset + ptr) as isize) as *mut u8;
             let s = std::ptr::slice_from_raw_parts_mut(p, data.len());
-            (*s).clone_from_slice(&data[..]);
+            (*s).clone_from_slice(data);
         }
 
         Ok(())
@@ -258,8 +256,8 @@ impl DMAControl for DirectDMA {
         let end = ptr + data.len() as u64;
         if end > self.size {
             return Err(Error::OutOfRange {
-                ptr: ptr,
-                end: end,
+                ptr,
+                end,
                 size: self.size,
             });
         }
@@ -275,6 +273,59 @@ impl DMAControl for DirectDMA {
             &self.memory[(self.offset + ptr) as usize..(self.offset + end) as usize],
         );
 
+        Ok(())
+    }
+}
+
+/// DMA implementation for SVM support
+///
+/// When using SVM buffer migrations to/from device memory can still be explicitly triggered,
+/// however, are controlled completely in the TLKM
+#[derive(Debug, Getters)]
+pub struct SVMDMA {
+    tlkm_file: Arc<File>,
+}
+
+impl SVMDMA {
+    pub fn new(tlkm_file: &Arc<File>) -> Self {
+        Self {
+            tlkm_file: tlkm_file.clone(),
+        }
+    }
+}
+
+impl DMAControl for SVMDMA {
+    fn copy_to(&self, data: &[u8], _ptr: DeviceAddress) -> Result<()> {
+        let base = data.as_ptr() as u64;
+        let size = data.len() as u64;
+        trace!("Start migration to device memory with base address = {:#02x} and size = {:#02x}.", base, size);
+        unsafe {
+            tlkm_ioctl_svm_migrate_to_dev(
+                self.tlkm_file.as_raw_fd(),
+                &mut tlkm_svm_migrate_cmd {
+                    vaddr: base,
+                    size,
+                },
+            ).context(DMAToDeviceSnafu)?;
+        }
+        trace!("Migration to device memory complete.");
+        Ok(())
+    }
+
+    fn copy_from(&self, _ptr: DeviceAddress, data: &mut [u8]) -> Result<()> {
+        let base = data.as_ptr() as u64;
+        let size = data.len() as u64;
+        trace!("Start migration to host memory with base address = {:#02x} and size = {:#02x}.", base, size);
+        unsafe {
+            tlkm_ioctl_svm_migrate_to_ram(
+                self.tlkm_file.as_raw_fd(),
+                &mut tlkm_svm_migrate_cmd {
+                    vaddr: base,
+                    size,
+                },
+            ).context(DMAFromDeviceSnafu)?;
+        }
+        trace!("Migration to host memory complete.");
         Ok(())
     }
 }

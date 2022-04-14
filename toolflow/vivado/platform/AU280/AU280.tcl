@@ -33,8 +33,14 @@ namespace eval platform {
     proc get_ignored_segments { } {
       set hbmInterfaces [hbm::get_hbm_interfaces]
       set ignored [list]
-      for {set i 0} {$i < [llength $hbmInterfaces]} {incr i} {
-        for {set j 0} {$j < [llength $hbmInterfaces]} {incr j} {
+      set numInterfaces [llength $hbmInterfaces]
+      if {[expr $numInterfaces % 2] == 1} {
+        set max_mem_index [expr $numInterfaces + 1]
+      } else {
+        set max_mem_index $numInterfaces
+      }
+      for {set i 0} {$i < $numInterfaces} {incr i} {
+        for {set j 0} {$j < $max_mem_index} {incr j} {
           set axi_index [format %02s $i]
           set mem_index [format %02s $j]
           lappend ignored "/hbm/hbm_0/SAXI_${axi_index}/HBM_MEM${mem_index}"
@@ -421,7 +427,7 @@ namespace eval platform {
   # Inserts a new register slice between given master and slave (for SLR crossing)
   proc insert_regslice {name default master slave clock reset subsystem} {
     if {[is_regslice_enabled $name $default]} {
-      set regslice [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_register_slice:2.1 $subsystem/regslice_${name}]
+      set regslice [tapasco::ip::create_axi_reg_slice $subsystem/regslice_${name}]
       set_property -dict [list CONFIG.REG_AW {15} CONFIG.REG_AR {15} CONFIG.REG_W {15} CONFIG.REG_R {15} CONFIG.REG_B {15} CONFIG.USE_AUTOPIPELINING {1}] $regslice
       delete_bd_objs [get_bd_intf_nets -of_objects [get_bd_intf_pins $master]]
       connect_bd_intf_net [get_bd_intf_pins $master] [get_bd_intf_pins $regslice/S_AXI]
@@ -444,6 +450,8 @@ namespace eval platform {
     }
     insert_regslice "host_arch" true "/host/M_ARCH" "/arch/S_ARCH" "/clocks_and_resets/design_clk" "/clocks_and_resets/design_interconnect_aresetn" ""
     insert_regslice "l2_cache" [tapasco::is_feature_enabled "Cache"] "/memory/cache_l2_0/M0_AXI" "/memory/mig/C0_DDR4_S_AXI" "/clocks_and_resets/mem_clk" "/clocks_and_resets/mem_peripheral_aresetn" "/memory"
+
+    insert_regslice "host_mmu" [tapasco::is_feature_enabled "SVM"] "/host/M_MMU" "/memory/S_MMU" "/clocks_and_resets/host_clk" "/clocks_and_resets/host_interconnect_aresetn" ""
 
     if {[is_regslice_enabled "pe" false]} {
       set ips [get_bd_cells /arch/target_ip_*]

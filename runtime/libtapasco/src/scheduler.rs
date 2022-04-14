@@ -73,51 +73,48 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(
-        pes: &Vec<crate::device::status::Pe>,
+        pes: &[crate::device::status::Pe],
         mmap: &Arc<MmapMut>,
         mut local_memories: VecDeque<Arc<OffchipMemory>>,
         completion: &File,
         debug_impls: &HashMap<String, Box<dyn DebugGenerator + Sync + Send>>,
         is_pcie: bool,
-    ) -> Result<Scheduler> {
+        svm_in_use: bool,
+    ) -> Result<Self> {
         let pe_hashed: Map<PEId, Injector<PE>> = Map::new();
         let mut pes_overview: HashMap<PEId, usize> = HashMap::new();
         let mut pes_name: HashMap<PEId, String> = HashMap::new();
 
-        let mut interrupt_id = 0;
-
-        if is_pcie {
-            interrupt_id = 4;
-        }
+        let mut interrupt_id = if is_pcie { 4 } else { 0 };
 
         for (i, pe) in pes.iter().enumerate() {
             let debug = match &pe.debug {
                 Some(x) => match debug_impls.get(&x.name) {
                     Some(y) => y
                         .new(mmap, x.name.clone(), x.offset, x.size)
-                        .context(DebugError)?,
+                        .context(DebugSnafu)?,
                     None => {
                         let d = UnsupportedDebugGenerator {};
-                        d.new(mmap, x.name.clone(), 0, 0).context(DebugError)?
+                        d.new(mmap, x.name.clone(), 0, 0).context(DebugSnafu)?
                     }
                 },
                 None => {
                     let d = NonDebugGenerator {};
                     d.new(mmap, "Unused".to_string(), 0, 0)
-                        .context(DebugError)?
+                        .context(DebugSnafu)?
                 }
             };
 
-            if pe.interrupts.len() > 0 {
-                interrupt_id = pe.interrupts[0].mapping as usize;
+            if pe.interrupts.is_empty() {
                 trace!(
-                    "Using status core mapped interrupt ID for PE {} -> {}.",
+                    "Using legacy guessed interrupt ID for PE {} -> {}.",
                     i,
                     interrupt_id
                 );
             } else {
+                interrupt_id = pe.interrupts[0].mapping as usize;
                 trace!(
-                    "Using legacy guessed interrupt ID for PE {} -> {}.",
+                    "Using status core mapped interrupt ID for PE {} -> {}.",
                     i,
                     interrupt_id
                 );
@@ -127,14 +124,13 @@ impl Scheduler {
                 i,
                 pe.id as PEId,
                 pe.offset,
-                pe.size,
-                pe.name.to_string(),
                 mmap.clone(),
-                &completion,
+                completion,
                 interrupt_id,
                 debug,
+                svm_in_use,
             )
-            .context(PEError)?;
+            .context(PESnafu)?;
 
             interrupt_id += 1;
 
@@ -163,10 +159,10 @@ impl Scheduler {
             };
         }
 
-        Ok(Scheduler {
+        Ok(Self {
             pes: pe_hashed,
-            pes_overview: pes_overview,
-            pes_name: pes_name,
+            pes_overview,
+            pes_name,
         })
     }
 
@@ -180,14 +176,14 @@ impl Scheduler {
                 }
                 thread::yield_now();
             },
-            None => return Err(Error::NoSuchPE { id }),
+            None => Err(Error::NoSuchPE { id }),
         }
     }
 
     pub fn release_pe(&self, pe: PE) -> Result<()> {
-        ensure!(!pe.active(), PEStillActive { pe: pe });
+        ensure!(!pe.active(), PEStillActiveSnafu { pe });
 
-        match self.pes.get(&pe.type_id()) {
+        match self.pes.get(pe.type_id()) {
             Some(l) => l.val().push(pe),
             None => return Err(Error::NoSuchPE { id: *pe.type_id() }),
         }
@@ -200,15 +196,15 @@ impl Scheduler {
             let mut maybe_pe = v.val().steal();
 
             while let Steal::Success(pe) = maybe_pe {
-                pe.enable_interrupt().context(PEError)?;
-                if pe.interrupt_set().context(PEError)? {
-                    pe.reset_interrupt(true).context(PEError)?;
+                pe.enable_interrupt().context(PESnafu)?;
+                if pe.interrupt_set().context(PESnafu)? {
+                    pe.reset_interrupt(true).context(PESnafu)?;
                 }
                 remove_pes.push(pe);
                 maybe_pe = v.val().steal();
             }
 
-            for pe in remove_pes.into_iter() {
+            for pe in remove_pes {
                 v.val().push(pe);
             }
         }
@@ -231,7 +227,7 @@ impl Scheduler {
         }
         Err(Error::PENotFound {
             name: name.to_string(),
-            possible: self.pes_name.values().map(|x| x.clone()).collect(),
+            possible: self.pes_name.values().cloned().collect(),
         })
     }
 }

@@ -273,6 +273,42 @@ ioctl_readwrite!(
     tlkm_dma_buffer_op
 );
 
+// SVM
+#[repr(C)]
+#[derive(Debug, PartialEq)]
+pub struct tlkm_svm_init_cmd {
+    pub result: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, PartialEq)]
+pub struct tlkm_svm_migrate_cmd {
+    pub vaddr: u64,
+    pub size: u64,
+}
+
+const TLKM_IOCTL_SVM_LAUNCH: u8 = 0x50;
+const TLKM_IOCTL_SVM_MIGRATE_TO_DEV: u8 = 0x52;
+const TLKM_IOCTL_SVM_MIGRATE_TO_RAM: u8 = 0x53;
+
+ioctl_readwrite!(tlkm_ioctl_svm_launch,
+    TLKM_DEVICE_IOC_MAGIC,
+    TLKM_IOCTL_SVM_LAUNCH,
+    tlkm_svm_init_cmd
+);
+
+ioctl_readwrite!(tlkm_ioctl_svm_migrate_to_dev,
+    TLKM_DEVICE_IOC_MAGIC,
+    TLKM_IOCTL_SVM_MIGRATE_TO_DEV,
+    tlkm_svm_migrate_cmd
+);
+
+ioctl_readwrite!(tlkm_ioctl_svm_migrate_to_ram,
+    TLKM_DEVICE_IOC_MAGIC,
+    TLKM_IOCTL_SVM_MIGRATE_TO_RAM,
+    tlkm_svm_migrate_cmd
+);
+
 // End of IOCTL definitions.
 
 /// TLKM IOCTL convenience access
@@ -309,41 +345,33 @@ impl Drop for TLKM {
 
 impl TLKM {
     /// Open the driver chardev.
-    pub fn new() -> Result<TLKM> {
+    pub fn new() -> Result<Self> {
         let default_config = include_str!("../config/default.toml");
-        let mut settings = Config::default();
-
-        settings
-            .merge(config::File::from_str(
+        let settings = Config::builder()
+            .add_source(config::File::from_str(
                 default_config,
                 config::FileFormat::Toml,
             ))
-            .context(ConfigError)?;
-
-        settings
-            .merge(config::File::with_name("/etc/tapasco/TapascoConfig").required(false))
-            .context(ConfigError)?;
-        settings
-            .merge(config::File::with_name("TapascoConfig").required(false))
-            .context(ConfigError)?;
-        settings
-            .merge(config::Environment::with_prefix("tapasco").separator("__"))
-            .context(ConfigError)?;
+            .add_source(config::File::with_name("/etc/tapasco/TapascoConfig").required(false))
+            .add_source(config::File::with_name("TapascoConfig").required(false))
+            .add_source(config::Environment::with_prefix("tapasco").separator("__"))
+            .build()
+            .context(ConfigSnafu)?;
 
         trace!("Using config: {:?}", settings);
 
         let path = PathBuf::from(
             settings
-                .get_str("tlkm.main_driver_file")
-                .context(ConfigError)?,
+                .get_string("tlkm.main_driver_file")
+                .context(ConfigSnafu)?,
         );
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
-            .context(DriverOpen { filename: path })?;
+            .context(DriverOpenSnafu { filename: path })?;
 
-        Ok(TLKM {
+        Ok(Self {
             file: Arc::new(file),
             settings: Arc::new(settings),
         })
@@ -354,16 +382,16 @@ impl TLKM {
     /// The version is provided as an undocumented string.
     /// Unstable and not intended for parsing by downstream code.
     pub fn version(&self) -> Result<String> {
-        let mut version: tlkm_ioctl_version_cmd = Default::default();
+        let mut version = tlkm_ioctl_version_cmd::default();
         unsafe {
-            tlkm_ioctl_version(self.file.as_raw_fd(), &mut version).context(IOCTLVersion)?;
+            tlkm_ioctl_version(self.file.as_raw_fd(), &mut version).context(IOCTLVersionSnafu)?;
         };
 
         let s = String::from_utf8_lossy(&version.version)
             .trim_matches(char::from(0))
             .to_string();
         trace!("Retrieved TLKM version as {}", s);
-        Ok(s.to_string())
+        Ok(s)
     }
 
     /// Retrieve length of device enumeration structure.
@@ -374,9 +402,9 @@ impl TLKM {
     /// [`device_enum_info`]: #method.device_enum_info
     pub fn device_enum_len(&self) -> Result<usize> {
         trace!("Fetching available devices from driver.");
-        let mut devices: tlkm_ioctl_enum_devices_cmd = Default::default();
+        let mut devices = tlkm_ioctl_enum_devices_cmd::default();
         unsafe {
-            tlkm_ioctl_enum(self.file.as_raw_fd(), &mut devices).context(IOCTLEnum)?;
+            tlkm_ioctl_enum(self.file.as_raw_fd(), &mut devices).context(IOCTLEnumSnafu)?;
         };
 
         trace!("There are {} devices.", devices.num_devs);
@@ -391,9 +419,9 @@ impl TLKM {
     /// [`DeviceInfo`]: struct.DeviceInfo.html
     pub fn device_enum_info(&self) -> Result<Vec<DeviceInfo>> {
         trace!("Fetching available devices from driver.");
-        let mut devices: tlkm_ioctl_enum_devices_cmd = Default::default();
+        let mut devices = tlkm_ioctl_enum_devices_cmd::default();
         unsafe {
-            tlkm_ioctl_enum(self.file.as_raw_fd(), &mut devices).context(IOCTLEnum)?;
+            tlkm_ioctl_enum(self.file.as_raw_fd(), &mut devices).context(IOCTLEnumSnafu)?;
         };
 
         trace!("There are {} devices.", devices.num_devs);
@@ -402,7 +430,7 @@ impl TLKM {
 
         for x in 0..devices.num_devs {
             if devices.devs[x].dev_id != x as u32 {
-                warn!("Got device ID mismatch. Falling back to own counting, assuming old TLKM: TLKM: {} vs Counting: {}", 
+                warn!("Got device ID mismatch. Falling back to own counting, assuming old TLKM: TLKM: {} vs Counting: {}",
                     devices.devs[x].dev_id, x);
                 devices.devs[x].dev_id = x as u32;
             }
@@ -415,7 +443,7 @@ impl TLKM {
                         .trim_matches(char::from(0))
                         .to_string(),
                 )
-                .context(FFINulError)?
+                .context(FFINulSnafu)?
                 .into_raw(),
             });
         }
@@ -441,21 +469,21 @@ impl TLKM {
         debug_impls: &HashMap<String, Box<dyn DebugGenerator + Sync + Send>>,
     ) -> Result<Device> {
         trace!("Fetching available devices from driver.");
-        let mut devices: tlkm_ioctl_enum_devices_cmd = Default::default();
+        let mut devices = tlkm_ioctl_enum_devices_cmd::default();
         unsafe {
-            tlkm_ioctl_enum(self.file.as_raw_fd(), &mut devices).context(IOCTLEnum)?;
+            tlkm_ioctl_enum(self.file.as_raw_fd(), &mut devices).context(IOCTLEnumSnafu)?;
         };
 
         trace!("There are {} devices.", devices.num_devs);
 
         for x in 0..devices.num_devs {
             if devices.devs[x].dev_id != x as u32 {
-                warn!("Got device ID mismatch. Falling back to own counting, assuming old TLKM: TLKM: {} vs Counting: {}", 
+                warn!("Got device ID mismatch. Falling back to own counting, assuming old TLKM: TLKM: {} vs Counting: {}",
                     devices.devs[x].dev_id, x);
                 devices.devs[x].dev_id = x as u32;
             }
             if devices.devs[x].dev_id == id {
-                return Ok(Device::new(
+                return Device::new(
                     self.file.clone(),
                     devices.devs[x].dev_id,
                     devices.devs[x].vendor_id,
@@ -466,10 +494,10 @@ impl TLKM {
                     self.settings.clone(),
                     debug_impls,
                 )
-                .context(DeviceError)?);
+                .context(DeviceSnafu);
             }
         }
-        Err(Error::DeviceNotFound { id: id })
+        Err(Error::DeviceNotFound { id })
     }
 
     /// Allocates all devices available.
@@ -484,9 +512,9 @@ impl TLKM {
         debug_impls: &HashMap<String, Box<dyn DebugGenerator + Sync + Send>>,
     ) -> Result<Vec<Device>> {
         trace!("Fetching available devices from driver.");
-        let mut devices: tlkm_ioctl_enum_devices_cmd = Default::default();
+        let mut devices = tlkm_ioctl_enum_devices_cmd::default();
         unsafe {
-            tlkm_ioctl_enum(self.file.as_raw_fd(), &mut devices).context(IOCTLEnum)?;
+            tlkm_ioctl_enum(self.file.as_raw_fd(), &mut devices).context(IOCTLEnumSnafu)?;
         };
 
         let mut v = Vec::new();
@@ -495,7 +523,7 @@ impl TLKM {
 
         for x in 0..devices.num_devs {
             if devices.devs[x].dev_id != x as u32 {
-                warn!("Got device ID mismatch. Falling back to own counting, assuming old TLKM: TLKM: {} vs Counting: {}", 
+                warn!("Got device ID mismatch. Falling back to own counting, assuming old TLKM: TLKM: {} vs Counting: {}",
                     devices.devs[x].dev_id, x);
                 devices.devs[x].dev_id = x as u32;
             }
@@ -511,7 +539,7 @@ impl TLKM {
                     self.settings.clone(),
                     debug_impls,
                 )
-                .context(DeviceError)?,
+                .context(DeviceSnafu)?,
             );
         }
 

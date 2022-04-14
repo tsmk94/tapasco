@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2014-2020 Embedded Systems and Applications, TU Darmstadt.
  *
- * This file is part of TaPaSCo 
+ * This file is part of TaPaSCo
  * (see https://github.com/esa-tu-darmstadt/tapasco).
  *
  * This program is free software: you can redistribute it and/or modify
@@ -27,6 +27,7 @@
 #include "pcie_device.h"
 #include "pcie_irq.h"
 #include "pcie_qdma.h"
+#include "pcie_svm.h"
 #include "tlkm_logging.h"
 #include "tlkm_device.h"
 #include "tlkm_bus.h"
@@ -381,6 +382,9 @@ int pcie_device_init_subsystems(struct tlkm_device *dev, void *data)
 {
 	int ret = 0;
 	uint32_t status, c;
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	dev_addr_t mmu_base;
+#endif
 	struct tlkm_pcie_device *pdev =
 		(struct tlkm_pcie_device *)dev->private_data;
 
@@ -414,20 +418,48 @@ int pcie_device_init_subsystems(struct tlkm_device *dev, void *data)
 		goto pcie_subsystem_err;
 	}
 
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	mmu_base =
+		tlkm_status_get_component_base(dev, "PLATFORM_COMPONENT_MMU");
+	if (mmu_base != -1) {
+		DEVLOG(dev->dev_id, TLKM_LF_DEVICE, "initializing SVM");
+		ret = pcie_init_svm(pdev);
+		if (ret) {
+			DEVERR(dev->dev_id, "failed to initialize SVM");
+			goto pcie_init_svm_err;
+		}
+	}
+#endif
+
 	DEVLOG(dev->dev_id, TLKM_LF_DEVICE,
 	       "successfully initialized subsystems");
 
 	return 0;
 
-pcie_qdma_init_err:
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+pcie_init_svm_err:
+	release_msi(pdev);
+#endif
 pcie_subsystem_err:
+pcie_qdma_init_err:
 	return ret;
 }
 
 void pcie_device_exit_subsystems(struct tlkm_device *dev)
 {
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	dev_addr_t mmu_base;
+#endif
 	struct tlkm_pcie_device *pdev =
 		(struct tlkm_pcie_device *)dev->private_data;
+
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	mmu_base = tlkm_status_get_component_base(dev, "PLATFORM_COMPONENT_MMU");
+	if (mmu_base != -1) {
+		pcie_exit_svm(pdev);
+	}
+#endif
+
 	release_msi(pdev);
 	if (pcie_is_qdma_in_use(dev)) {
 		if (pcie_qdma_exit(pdev)) {
@@ -444,6 +476,10 @@ void pcie_device_miscdev_close(struct tlkm_device *dev)
 
 	int i;
 
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	dev_addr_t mmu_base;
+#endif
+
 	for (i = 0; i < TLKM_PCIE_NUM_DMA_BUFFERS; ++i) {
 		if (pdev->dma_buffer[i].ptr != 0) {
 			pcie_device_dma_free_buffer(
@@ -454,6 +490,15 @@ void pcie_device_miscdev_close(struct tlkm_device *dev)
 			pdev->dma_buffer[i].size = 0;
 		}
 	}
+
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	mmu_base =
+		tlkm_status_get_component_base(dev, "PLATFORM_COMPONENT_MMU");
+	if (mmu_base != -1) {
+		DEVLOG(dev->dev_id, TLKM_LF_DEVICE, "tear down SVM");
+		pcie_teardown_svm(dev);
+	}
+#endif
 }
 
 int pcie_device_dma_allocate_buffer(dev_id_t dev_id, struct tlkm_device *dev,
